@@ -255,6 +255,7 @@ class LLM(RetryMixin, DebugMixin):
 
             kwargs['messages'] = messages
 
+            global_step = kwargs.pop("global_step", "")
             # handle conversion of to non-function calling messages if needed
             original_fncall_messages = copy.deepcopy(messages)
             mock_fncall_tools = None
@@ -374,7 +375,7 @@ class LLM(RetryMixin, DebugMixin):
                 assert self.config.log_completions_folder is not None
                 log_file = os.path.join(
                     self.config.log_completions_folder,
-                    f'{self.config.model.replace("/", "__")}-{time.time()}.json',
+                    f'{self.config.model.replace("/", "__")}-{global_step}-{time.time()}.json',
                 )
 
                 # set up the dict to be logged
@@ -389,6 +390,7 @@ class LLM(RetryMixin, DebugMixin):
                     },
                     'timestamp': time.time(),
                     'cost': cost,
+                    'global_step': global_step
                 }
 
                 # if non-native function calling, save messages/response separately
