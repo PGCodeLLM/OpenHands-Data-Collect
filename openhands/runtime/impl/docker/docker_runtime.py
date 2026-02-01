@@ -134,6 +134,7 @@ class DockerRuntime(ActionExecutionClient):
         self.base_container_image = self.config.sandbox.base_container_image
         self.runtime_container_image = self.config.sandbox.runtime_container_image
         self.container_name = CONTAINER_NAME_PREFIX + sid
+        self.python_executable = self.config.sandbox.python_executable
         self.container: Container | None = None
         self.main_module = main_module
 
@@ -491,6 +492,9 @@ class DockerRuntime(ActionExecutionClient):
         )
 
         command = self.get_action_execution_server_startup_command()
+        if self.python_executable != "python":
+            command = ["/bin/bash", "-c", "apt-get update && apt-get install -y tmux jq && " + " ".join(command)]
+
         self.log('info', f'Starting server with command: {command}')
 
         if self.config.sandbox.enable_gpu:
@@ -761,4 +765,5 @@ class DockerRuntime(ActionExecutionClient):
             plugins=self.plugins,
             app_config=self.config,
             main_module=self.main_module,
+            python_executable=self.python_executable
         )

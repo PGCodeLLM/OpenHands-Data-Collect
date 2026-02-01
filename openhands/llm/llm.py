@@ -402,7 +402,7 @@ class LLM(RetryMixin, DebugMixin):
                     _d['fncall_messages'] = original_fncall_messages
                     _d['fncall_response'] = resp
                 with open(log_file, 'w') as f:
-                    f.write(json.dumps(_d))
+                    f.write(json.dumps(_d, indent=4))
 
             return resp
 

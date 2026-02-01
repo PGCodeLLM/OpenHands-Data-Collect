@@ -44,7 +44,8 @@ def get_action_execution_server_startup_command(
         'openhands' if app_config.run_as_openhands else 'root'
     )
     user_id = override_user_id or (1000 if app_config.run_as_openhands else 0)
-
+    if python_executable != 'python':
+        python_prefix = []
     base_cmd = [
         *python_prefix,
         python_executable,

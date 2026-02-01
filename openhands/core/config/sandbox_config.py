@@ -95,6 +95,7 @@ class SandboxConfig(BaseModel):
 
     cuda_visible_devices: str | None = Field(default=None)
     model_config = ConfigDict(extra='forbid')
+    python_executable : str | None = Field(default='python')
 
     @classmethod
     def from_toml_section(cls, data: dict) -> dict[str, 'SandboxConfig']:

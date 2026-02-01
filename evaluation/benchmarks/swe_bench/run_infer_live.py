@@ -39,6 +39,7 @@ from evaluation.utils.shared import (
     update_llm_config_for_completions_logging,
     _process_instance_wrapper_mp,
     _process_instance_wrapper,
+    cleanup
 )
 from openhands.controller.state.state import State
 from openhands.core.config import (
@@ -71,6 +72,7 @@ import docker
 from pathlib import Path
 from tqdm import tqdm
 import multiprocessing as mp
+import re
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
@@ -80,22 +82,31 @@ BenchMode = Literal['swe', 'swt', 'swt-ci']
 # Global variable to track dataset type
 DATASET_TYPE = 'SWE-bench'
 
+# TODO: migrate all swe-bench docker to ghcr.io/openhands
+DEFAULT_DOCKER_IMAGE_PREFIX = os.environ.get(
+    'EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/'
+)
+logger.info(f'Default docker image prefix: {DEFAULT_DOCKER_IMAGE_PREFIX}')
+
 
 def set_dataset_type(dataset_name: str) -> str:
     """Set dataset type based on dataset name."""
-    global DATASET_TYPE
+    global DATASET_TYPE, DEFAULT_DOCKER_IMAGE_PREFIX
     name_lower = dataset_name.lower()
 
     if 'swe-gym' in name_lower:
         DATASET_TYPE = 'SWE-Gym'
     elif 'swe-bench-live' in name_lower:
         DATASET_TYPE = 'SWE-bench-Live'
+        DEFAULT_DOCKER_IMAGE_PREFIX = 'docker.io/starryzhang/'
     elif 'rebench' in name_lower:
         DATASET_TYPE = 'SWE-rebench'
+        DEFAULT_DOCKER_IMAGE_PREFIX = 'docker.io/swerebench/'
     elif 'multimodal' in name_lower:
         DATASET_TYPE = 'Multimodal'
     else:
         DATASET_TYPE = 'SWE-bench'
+        DEFAULT_DOCKER_IMAGE_PREFIX = 'docker.io/swebench/'
 
     logger.info(f'Dataset type set to: {DATASET_TYPE}')
 
@@ -174,12 +185,6 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageActio
     return MessageAction(content=instruction)
 
 
-# TODO: migrate all swe-bench docker to ghcr.io/openhands
-DEFAULT_DOCKER_IMAGE_PREFIX = os.environ.get(
-    'EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/'
-)
-logger.info(f'Default docker image prefix: {DEFAULT_DOCKER_IMAGE_PREFIX}')
-
 
 def get_instance_docker_image(
     instance_id: str,
@@ -189,12 +194,7 @@ def get_instance_docker_image(
         # Official SWE-Bench image
         # swebench/sweb.eval.x86_64.django_1776_django-11333:v1
         # SWE-bench-Live uses the same naming convention as SWE-Bench
-        if DATASET_TYPE == 'SWE-bench-Live':
-            docker_image_prefix = 'docker.io/starryzhang/'
-        elif DATASET_TYPE == 'SWE-bench':
-            docker_image_prefix = 'docker.io/swebench/'
-        elif DATASET_TYPE == 'SWE-rebench':
-            docker_image_prefix = 'docker.io/swerebench/'
+        docker_image_prefix = DEFAULT_DOCKER_IMAGE_PREFIX
         repo, name = instance_id.split('__')
         image_name = f'{docker_image_prefix.rstrip("/")}/sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
         logger.debug(f'Using official SWE-Bench image: {image_name}')
@@ -236,6 +236,13 @@ def get_config(
         dataset_name=metadata.dataset,
         instance_id=instance['instance_id'],
     )
+    is_create_image = metadata.details.get("is_create_image", True)
+    if not is_create_image:
+        sandbox_config.runtime_container_image = base_container_image
+        sandbox_config.python_executable = "/openhands/poetry/openhands-ai-5O4_aCHf-py3.12/bin/python"
+        volume_path = "/shared_workspace/yanruo/repo/OpenHands-Data-Collect"
+        os.system(f"cp -rf {volume_path}/openhands {volume_path}/Volume/code/")
+        sandbox_config.volumes=f"{volume_path}/Volume/micromamba:/openhands/micromamba:ro,{volume_path}/Volume/poetry:/openhands/poetry:ro,{volume_path}/Volume/code/openhands:/openhands/code/openhands:ro"
 
     config = get_openhands_config_for_eval(
         metadata=metadata,
@@ -253,7 +260,7 @@ def get_config(
     )
     # get 'draft_editor' config if exists
     config.set_llm_config(get_llm_config_arg('draft_editor'), 'draft_editor')
-    config.set_llm_config(True, 'disable_stop_word')
+    config.llms["llm"].disable_stop_word = True
 
     model_routing_config = get_model_routing_config_arg()
     model_routing_config.llms_for_routing = (
@@ -751,10 +758,13 @@ def run_eval(instance, pred_path, output_dir, force_eval=False):
         return
 
     jd = json.load(open(pred_path))
+    patch = jd['test_result']['git_patch']
+    # patch = re.sub(r'^[\s\+]*#.*\n?', '', jd['test_result']['git_patch'], flags=re.MULTILINE)
+    # patch = re.sub(r'^[\\] No newline at end of file\n?', '+\n', patch, flags=re.MULTILINE)
     pred = {
         'instance_id': jd['instance_id'],
         'model_name_or_path': jd['metadata']['llm_config']['model'],
-        'model_patch': jd['test_result']['git_patch'],
+        'model_patch': patch
     }
     if pred["model_patch"] == "":
         logger.info(f'instance {instance.instance_id} - EMPTY PATCH')
@@ -762,7 +772,8 @@ def run_eval(instance, pred_path, output_dir, force_eval=False):
 
     logger.info(f'Starting swebench evaluation for instance {pred['instance_id']}.')
     instance_id = pred['instance_id']
-    namespace = "starryzhang"
+    namespace = DEFAULT_DOCKER_IMAGE_PREFIX.replace("docker.io/", "").rstrip("/")
+    logger.info(f"{namespace}")
     instance_image_tag= "latest"
 
     run_instance(
@@ -779,7 +790,15 @@ def run_eval(instance, pred_path, output_dir, force_eval=False):
 
     return
 
-def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
+def filter_dataset(dataset: pd.DataFrame, data_dir: str) -> pd.DataFrame:
+    valid_file_path = os.path.join(data_dir, "valid.txt")
+    if os.path.exists(valid_file_path):
+        valid_docker = set([a.strip() for a in open(valid_file_path)])
+
+        logger.info(f"using valid.txt with for valid instance_id {len(valid_docker)}")
+        dataset = dataset[dataset["instance_id"].isin(valid_docker)]
+
+    print(f"valid subset: {len(dataset)}")
     return dataset
 
 def prepare_dataset(
@@ -788,6 +807,7 @@ def prepare_dataset(
     eval_n_limit: int,
     eval_ids: list[str] | None = None,
     skip_num: int | None = None,
+    eval_only: bool | None = None,
 ):
     assert 'instance_id' in dataset.columns, (
         "Expected 'instance_id' column in the dataset. You should define your own unique identifier for each instance and use it as the 'instance_id' column."
@@ -800,18 +820,12 @@ def prepare_dataset(
         for instance_id in os.listdir(eval_outputs_dir):
             if check_eval_finish(os.path.join(eval_outputs_dir, instance_id)):
                 finished_ids.add(instance_id)
+            elif eval_only and os.path.exists(os.path.join(eval_outputs_dir, instance_id, "pred.json")):
+                finished_ids.add(instance_id)
     if eval_ids:
         eval_ids_converted = [dataset[id_column].dtype.type(id) for id in eval_ids]
         dataset = dataset[dataset[id_column].isin(eval_ids_converted)]
         logger.info(f'Limiting evaluation to {len(eval_ids)} specific instances.')
-    elif eval_n_limit and eval_n_limit > 0:
-        # Use fixed random seed 42 for sampling without replacement
-        dataset = dataset.sample(
-            min(eval_n_limit, len(dataset)), random_state=42, replace=False
-        )
-        logger.info(
-            f'Randomly sampling {eval_n_limit} unique instances with random seed 42.'
-        )
 
     def make_serializable(instance: pd.Series) -> dict:
         import numpy as np
@@ -832,8 +846,16 @@ def prepare_dataset(
     logger.info(
         f'Finished instances: {len(finished_ids)}, Remaining instances: {len(new_dataset)}'
     )
-
-    return pd.DataFrame(new_dataset)
+    new_dataset = pd.DataFrame(new_dataset)
+    if eval_n_limit and eval_n_limit > 0:
+        # Use fixed random seed 42 for sampling without replacement
+        new_dataset = new_dataset.sample(
+            min(eval_n_limit, len(new_dataset)), random_state=42, replace=False
+        )
+        logger.info(
+            f'Randomly sampling {eval_n_limit} unique instances with random seed 42.'
+        )
+    return new_dataset
 
 
 def run_evaluation(
@@ -932,6 +954,12 @@ if __name__ == '__main__':
         help='data set to evaluate on, either full-test or lite-test',
     )
     parser.add_argument(
+        '--dataset_dir',
+        type=str,
+        default=None,
+        help='data set to evaluate on, either full-test or lite-test',
+    )
+    parser.add_argument(
         '--split',
         type=str,
         default='test',
@@ -945,23 +973,26 @@ if __name__ == '__main__':
         help="mode to run the evaluation, either 'swe', 'swt', or 'swt-ci'",
     )
     parser.add_argument('--force_eval', action="store_true")
+    parser.add_argument('--eval_only', action="store_true")
+    parser.add_argument('--is_create_image', action="store_true")
 
     args, _ = parser.parse_known_args()
 
     args.agent_cls = "CodeActAgent"
     args.mode = "swe"
-    args.eval_note = "v2-distilling"
+    # args.eval_note = "v2-distilling"
 
-    args.dataset = "SWE-bench-Live/SWE-bench-Live"
-    args.max_iterations = 100
-    args.eval_num_workers = 1
-    args.split = "full"
-    args.eval_n_limit = 1
-    args.llm_config = "llm.deepswe32b_cyber3"
-
+    # args.dataset = "SWE-bench-Live/SWE-bench-Live"
+    # args.max_iterations = 50
+    # args.eval_num_workers = 1
+    # args.split = "full"
+    # args.eval_n_limit = 2
+    # args.llm_config = "llm.deepswe32b_cyber3"
+    # # args.llm_config = "llm.Qwen3-Coder-30B-toolcalling"
+    # args.is_create_image = False
     os.environ["EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED"] = "true"
 
-    args.dataset_dir = "/shared_workspace/yanruo/data/Public/SWE-bench-Live"
+    # args.dataset_dir = "/shared_workspace/yanruo/data/Public/SWE-bench-Live"
     dataset = load_dataset_local(args.dataset_dir, args.split)
     # dataset = load_dataset(args.dataset, split=args.split)
 
@@ -985,7 +1016,11 @@ if __name__ == '__main__':
     if args.agent_config:
         agent_config = get_agent_config_arg(args.agent_config, args.config_file)
 
-    details = {'mode': args.mode, "force_eval": args.force_eval}
+    details = {
+        'mode': args.mode,
+        "force_eval": args.force_eval,
+        "is_create_image": args.is_create_image
+    }
     dataset_descrption = (args.dataset.replace('/', '__') + '-' + args.split.replace('/', '__'))
     metadata = make_metadata(
         llm_config,
